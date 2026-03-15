@@ -7,6 +7,7 @@ from typing import Mapping
 
 
 VALID_MODES = {"off", "monitor", "enforce"}
+VALID_VIOLATION_BEHAVIORS = {"error", "end", "replace"}
 
 
 def _normalize_mode(value: str | None, *, default: str) -> str:
@@ -81,6 +82,18 @@ def _normalize_runtime_endpoint(value: str | None) -> str | None:
     return endpoint
 
 
+def _normalize_violation_behavior(value: str | None, *, default: str = "error") -> str:
+    if value is None:
+        return default
+
+    behavior = value.strip().lower()
+    if behavior not in VALID_VIOLATION_BEHAVIORS:
+        expected = sorted(VALID_VIOLATION_BEHAVIORS)
+        raise ValueError(f"Unsupported violation behavior: {value!r}. Expected one of {expected}.")
+
+    return behavior
+
+
 @dataclass(frozen=True)
 class EndpointSettings:
     mode: str
@@ -115,9 +128,16 @@ class AIDefenseSettings:
     pool_max_keepalive: int | None = None
     llm_default_rules: tuple[str, ...] = ()
     llm_entity_types: tuple[str, ...] = ()
+    violation_behavior: str = "error"
+    violation_message: str | None = None
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str] | None = None) -> "AIDefenseSettings":
+    def from_env(
+        cls,
+        env: Mapping[str, str] | None = None,
+        *,
+        validate: bool = True,
+    ) -> "AIDefenseSettings":
         values = dict(os.environ if env is None else env)
 
         llm_mode = _normalize_mode(values.get("AGENTSEC_API_MODE_LLM"), default="monitor")
@@ -152,18 +172,21 @@ class AIDefenseSettings:
             pool_max_keepalive=_parse_int(values.get("AGENTSEC_POOL_MAX_KEEPALIVE")),
             llm_default_rules=_parse_list(values.get("AGENTSEC_LLM_RULES")),
             llm_entity_types=_parse_list(values.get("AGENTSEC_LLM_ENTITY_TYPES")),
+            violation_behavior=_normalize_violation_behavior(values.get("AGENTSEC_VIOLATION_BEHAVIOR")),
+            violation_message=values.get("AGENTSEC_VIOLATION_MESSAGE"),
         )
 
-        settings.validate()
+        if validate:
+            settings.validate()
         return settings
 
     def validate(self) -> None:
         self.llm.validate("LLM")
         self.tools.validate("tool")
+        _normalize_violation_behavior(self.violation_behavior)
 
 
 def _ms_from_seconds(value: int | None) -> int | None:
     if value is None:
         return None
     return value * 1000
-

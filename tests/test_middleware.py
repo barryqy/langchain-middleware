@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
-from langchain.agents.middleware.types import ModelRequest, ModelResponse
+from langchain.agents.middleware.types import ExtendedModelResponse, ModelRequest, ModelResponse
 from langchain_core.language_models import FakeListChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
@@ -75,7 +76,13 @@ class StubMCPInspector:
         return None
 
 
-def make_settings(*, llm_mode: str = "monitor", tool_mode: str = "monitor") -> AIDefenseSettings:
+def make_settings(
+    *,
+    llm_mode: str = "monitor",
+    tool_mode: str = "monitor",
+    violation_behavior: str = "error",
+    violation_message: str | None = None,
+) -> AIDefenseSettings:
     return AIDefenseSettings(
         llm=EndpointSettings(
             mode=llm_mode,
@@ -89,6 +96,8 @@ def make_settings(*, llm_mode: str = "monitor", tool_mode: str = "monitor") -> A
             api_key="tool-key",
             fail_open=True,
         ),
+        violation_behavior=violation_behavior,
+        violation_message=violation_message,
     )
 
 
@@ -164,6 +173,85 @@ def test_wrap_model_call_blocks_in_enforce_mode_before_handler():
     assert called is False
 
 
+def test_wrap_model_call_ends_with_violation_message():
+    middleware = AIDefenseMiddleware(
+        settings=make_settings(
+            llm_mode="enforce",
+            tool_mode="off",
+            violation_behavior="end",
+        ),
+        llm_inspector=StubLLMInspector(request_decision=block_decision("bad prompt")),
+        mcp_inspector=StubMCPInspector(),
+    )
+
+    called = False
+
+    def handler(_: ModelRequest) -> ModelResponse:
+        nonlocal called
+        called = True
+        return ModelResponse(result=[AIMessage(content="should not happen")])
+
+    result = middleware.wrap_model_call(make_model_request(), handler)
+
+    assert isinstance(result, AIMessage)
+    assert result.content == "AI Defense blocked llm_request: bad prompt"
+    assert called is False
+
+
+def test_wrap_model_call_replaces_last_request_message():
+    seen_messages: list[BaseMessage] = []
+    middleware = AIDefenseMiddleware(
+        settings=make_settings(
+            llm_mode="enforce",
+            tool_mode="off",
+            violation_behavior="replace",
+        ),
+        llm_inspector=StubLLMInspector(request_decision=block_decision("bad prompt")),
+        mcp_inspector=StubMCPInspector(),
+    )
+
+    def handler(request: ModelRequest) -> ModelResponse:
+        seen_messages.extend(request.messages)
+        return ModelResponse(result=[AIMessage(content="safe")])
+
+    result = middleware.wrap_model_call(make_model_request(), handler)
+
+    assert isinstance(result, ModelResponse)
+    assert seen_messages[-1].content == "AI Defense blocked llm_request: bad prompt"
+
+
+def test_wrap_model_call_replace_rewrites_system_and_request_messages():
+    seen: dict[str, Any] = {}
+    middleware = AIDefenseMiddleware(
+        settings=make_settings(
+            llm_mode="enforce",
+            tool_mode="off",
+            violation_behavior="replace",
+        ),
+        llm_inspector=StubLLMInspector(request_decision=block_decision("bad prompt")),
+        mcp_inspector=StubMCPInspector(),
+    )
+    request = ModelRequest(
+        model=FakeListChatModel(responses=["unused"]),
+        system_message=SystemMessage(content="hidden system prompt"),
+        messages=[HumanMessage(content="safe user prompt")],
+        state={"messages": [HumanMessage(content="safe user prompt")]},
+        runtime=SimpleNamespace(),
+    )
+
+    def handler(current_request: ModelRequest) -> ModelResponse:
+        seen["system"] = current_request.system_message.content if current_request.system_message else None
+        seen["messages"] = [message.content for message in current_request.messages]
+        seen["state_messages"] = [message.content for message in current_request.state["messages"]]
+        return ModelResponse(result=[AIMessage(content="safe")])
+
+    middleware.wrap_model_call(request, handler)
+
+    assert seen["system"] == "AI Defense blocked llm_request: bad prompt"
+    assert seen["messages"] == ["AI Defense blocked llm_request: bad prompt"]
+    assert seen["state_messages"] == ["AI Defense blocked llm_request: bad prompt"]
+
+
 @pytest.mark.asyncio
 async def test_awrap_model_call_uses_async_inspector():
     llm = StubLLMInspector()
@@ -186,6 +274,35 @@ async def _return_model_response(_: ModelRequest) -> ModelResponse:
     return ModelResponse(result=[AIMessage(content="Async ok")])
 
 
+def test_wrap_model_call_replace_preserves_extended_model_response_shape():
+    command = Command(update={"flag": True})
+    middleware = AIDefenseMiddleware(
+        settings=make_settings(
+            llm_mode="enforce",
+            tool_mode="off",
+            violation_behavior="replace",
+        ),
+        llm_inspector=StubLLMInspector(response_decision=block_decision("bad output")),
+        mcp_inspector=StubMCPInspector(),
+    )
+
+    result = middleware.wrap_model_call(
+        make_model_request(),
+        lambda request: ExtendedModelResponse(
+            model_response=ModelResponse(
+                result=[AIMessage(content="unsafe output")],
+                structured_response={"answer": "unsafe"},
+            ),
+            command=command,
+        ),
+    )
+
+    assert isinstance(result, ExtendedModelResponse)
+    assert result.command is command
+    assert result.model_response.structured_response == {"answer": "unsafe"}
+    assert result.model_response.result[0].content == "AI Defense blocked llm_response: bad output"
+
+
 def test_wrap_tool_call_blocks_before_execution():
     mcp = StubMCPInspector(request_decision=block_decision("tool blocked"))
     middleware = AIDefenseMiddleware(
@@ -205,6 +322,117 @@ def test_wrap_tool_call_blocks_before_execution():
         middleware.wrap_tool_call(make_tool_request(), handler)
 
     assert called is False
+
+
+def test_wrap_tool_call_replaces_blocked_request_with_tool_message():
+    mcp = StubMCPInspector(request_decision=block_decision("tool blocked"))
+    middleware = AIDefenseMiddleware(
+        settings=make_settings(
+            llm_mode="off",
+            tool_mode="enforce",
+            violation_behavior="replace",
+        ),
+        llm_inspector=StubLLMInspector(),
+        mcp_inspector=mcp,
+    )
+
+    called = False
+
+    def handler(_: ToolCallRequest):
+        nonlocal called
+        called = True
+        return ToolMessage(content="nope", tool_call_id="call-1")
+
+    result = middleware.wrap_tool_call(make_tool_request(), handler)
+
+    assert isinstance(result, ToolMessage)
+    assert result.content == "AI Defense blocked tool_request: tool blocked"
+    assert result.status == "error"
+    assert called is False
+
+
+def test_wrap_tool_call_end_marks_state_for_exit():
+    mcp = StubMCPInspector(request_decision=block_decision("tool blocked"))
+    middleware = AIDefenseMiddleware(
+        settings=make_settings(
+            llm_mode="off",
+            tool_mode="enforce",
+            violation_behavior="end",
+        ),
+        llm_inspector=StubLLMInspector(),
+        mcp_inspector=mcp,
+    )
+
+    result = middleware.wrap_tool_call(make_tool_request(), lambda request: ToolMessage(content="ok", tool_call_id=request.tool_call["id"]))
+
+    assert isinstance(result, Command)
+    assert result.update["aidefense_pending_end_message"] == "AI Defense blocked tool_request: tool blocked"
+
+
+def test_constructor_skips_tool_validation_when_tool_hooks_disabled():
+    settings = AIDefenseSettings(
+        llm=EndpointSettings(mode="off", endpoint=None, api_key=None, fail_open=True),
+        tools=EndpointSettings(mode="monitor", endpoint=None, api_key=None, fail_open=True),
+    )
+
+    middleware = AIDefenseMiddleware(
+        settings=settings,
+        inspect_tool_requests=False,
+        inspect_tool_responses=False,
+        llm_inspector=StubLLMInspector(),
+        mcp_inspector=None,
+    )
+
+    assert middleware.inspect_tool_requests is False
+    assert middleware.inspect_tool_responses is False
+
+
+def test_constructor_skips_llm_validation_when_model_hooks_disabled():
+    settings = AIDefenseSettings(
+        llm=EndpointSettings(mode="monitor", endpoint=None, api_key=None, fail_open=True),
+        tools=EndpointSettings(mode="off", endpoint=None, api_key=None, fail_open=True),
+    )
+
+    middleware = AIDefenseMiddleware(
+        settings=settings,
+        inspect_model_requests=False,
+        inspect_model_responses=False,
+        llm_inspector=None,
+        mcp_inspector=StubMCPInspector(),
+    )
+
+    assert middleware.inspect_model_requests is False
+    assert middleware.inspect_model_responses is False
+
+
+def test_from_env_skips_tool_validation_when_tool_hooks_disabled():
+    middleware = AIDefenseMiddleware.from_env(
+        env={
+            "AI_DEFENSE_API_MODE_LLM_ENDPOINT": "https://example.com",
+            "AI_DEFENSE_API_MODE_LLM_API_KEY": "x" * 64,
+            "AGENTSEC_API_MODE_LLM": "monitor",
+        },
+        inspect_tool_requests=False,
+        inspect_tool_responses=False,
+    )
+
+    assert middleware.inspect_tool_requests is False
+    assert middleware.inspect_tool_responses is False
+
+
+def test_from_env_skips_llm_validation_when_model_hooks_disabled():
+    middleware = AIDefenseMiddleware.from_env(
+        env={
+            "AI_DEFENSE_API_MODE_MCP_ENDPOINT": "https://example.com",
+            "AI_DEFENSE_API_MODE_MCP_API_KEY": "y" * 64,
+            "AGENTSEC_API_MODE_MCP": "monitor",
+        },
+        inspect_model_requests=False,
+        inspect_model_responses=False,
+    )
+
+    assert middleware.inspect_model_requests is False
+    assert middleware.inspect_model_responses is False
 
 
 def test_wrap_tool_call_inspects_response_payload():

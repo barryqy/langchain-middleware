@@ -29,6 +29,8 @@ def test_from_env_parses_optional_tuning_values():
             "AGENTSEC_RETRY_TOTAL": "4",
             "AGENTSEC_RETRY_BACKOFF_FACTOR": "1.5",
             "AGENTSEC_RETRY_STATUS_FORCELIST": "429,500,503",
+            "AGENTSEC_VIOLATION_BEHAVIOR": "replace",
+            "AGENTSEC_VIOLATION_MESSAGE": "blocked: {phase}",
         }
     )
 
@@ -38,4 +40,5 @@ def test_from_env_parses_optional_tuning_values():
     assert settings.retry_status_codes == (429, 500, 503)
     assert settings.llm_default_rules == ("Prompt Injection", "PII")
     assert settings.llm_entity_types == ("EMAIL", "PHONE_NUMBER")
-
+    assert settings.violation_behavior == "replace"
+    assert settings.violation_message == "blocked: {phase}"

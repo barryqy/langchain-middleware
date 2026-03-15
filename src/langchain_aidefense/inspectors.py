@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import json
 import logging
 import time
 from dataclasses import asdict, is_dataclass
@@ -10,8 +9,11 @@ from typing import Any
 
 import requests
 from aidefense import ChatInspectionClient, Config
+from aidefense.exceptions import ApiError
 from aidefense.runtime.chat_models import Message, Role
 from aidefense.runtime.models import InspectionConfig, Metadata, Rule, RuleName
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .decision import Decision
 
@@ -24,11 +26,29 @@ class _StandaloneConfig(Config):
         return object.__new__(cls)
 
 
-def _make_config(runtime_base_url: str, timeout_ms: int | None, custom_logger: logging.Logger) -> Config:
-    config = _StandaloneConfig(
+def _make_config(
+    runtime_base_url: str,
+    timeout_ms: int | None,
+    custom_logger: logging.Logger,
+    *,
+    pool_max_connections: int | None,
+    pool_max_keepalive: int | None,
+) -> Config:
+    config = _StandaloneConfig()
+    config._initialize(
         runtime_base_url=runtime_base_url,
         timeout=None if timeout_ms is None else max(1, int(timeout_ms / 1000)),
         logger=custom_logger,
+        retry_config={
+            # The middleware owns retry policy, so keep the SDK transport single-shot.
+            "total": 0,
+            "backoff_factor": 0,
+            "status_forcelist": [],
+        },
+        pool_config=_pool_config(
+            pool_max_connections=pool_max_connections,
+            pool_max_keepalive=pool_max_keepalive,
+        ),
     )
     config.runtime_base_url = runtime_base_url.rstrip("/")
     return config
@@ -45,6 +65,9 @@ class LLMInspector:
         timeout_ms: int | None = None,
         retry_total: int | None = None,
         retry_backoff: float | None = None,
+        retry_status_codes: list[int] | None = None,
+        pool_max_connections: int | None = None,
+        pool_max_keepalive: int | None = None,
         fail_open: bool = True,
         logger_instance: logging.Logger | None = None,
         **_: Any,
@@ -56,6 +79,9 @@ class LLMInspector:
         self.timeout_ms = timeout_ms
         self.retry_total = max(1, retry_total or 1)
         self.retry_backoff = max(0.0, retry_backoff or 0.0)
+        self.retry_status_codes = tuple(retry_status_codes or (429, 500, 502, 503, 504))
+        self.pool_max_connections = pool_max_connections
+        self.pool_max_keepalive = pool_max_keepalive
         self.fail_open = fail_open
         self.logger = logger_instance or logger
         self._client: ChatInspectionClient | None = None
@@ -86,7 +112,13 @@ class LLMInspector:
 
     def _get_client(self) -> ChatInspectionClient:
         if self._client is None:
-            config = _make_config(self.endpoint or "", self.timeout_ms, self.logger)
+            config = _make_config(
+                self.endpoint or "",
+                self.timeout_ms,
+                self.logger,
+                pool_max_connections=self.pool_max_connections,
+                pool_max_keepalive=self.pool_max_keepalive,
+            )
             self._client = ChatInspectionClient(api_key=self.api_key, config=config)
         return self._client
 
@@ -98,7 +130,7 @@ class LLMInspector:
                 return _decision_from_inspect_response(response)
             except Exception as exc:  # defensive on SDK/runtime mismatches
                 last_error = exc
-                if attempt >= self.retry_total - 1:
+                if attempt >= self.retry_total - 1 or not self._should_retry(exc):
                     break
                 if self.retry_backoff > 0:
                     time.sleep(self.retry_backoff * (2 ** attempt))
@@ -110,6 +142,16 @@ class LLMInspector:
 
         raise last_error  # type: ignore[misc]
 
+    def _should_retry(self, error: Exception) -> bool:
+        if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(error, requests.HTTPError):
+            response = getattr(error, "response", None)
+            return bool(response is not None and response.status_code in self.retry_status_codes)
+        if isinstance(error, ApiError):
+            return bool(error.status_code in self.retry_status_codes)
+        return False
+
 
 class MCPInspector:
     def __init__(
@@ -120,6 +162,9 @@ class MCPInspector:
         timeout_ms: int | None = None,
         retry_total: int | None = None,
         retry_backoff: float | None = None,
+        retry_status_codes: list[int] | None = None,
+        pool_max_connections: int | None = None,
+        pool_max_keepalive: int | None = None,
         fail_open: bool = True,
         logger_instance: logging.Logger | None = None,
         **_: Any,
@@ -129,6 +174,9 @@ class MCPInspector:
         self.timeout_ms = timeout_ms
         self.retry_total = max(1, retry_total or 1)
         self.retry_backoff = max(0.0, retry_backoff or 0.0)
+        self.retry_status_codes = tuple(retry_status_codes or (429, 500, 502, 503, 504))
+        self.pool_max_connections = pool_max_connections
+        self.pool_max_keepalive = pool_max_keepalive
         self.fail_open = fail_open
         self.logger = logger_instance or logger
         self._counter = itertools.count(1)
@@ -138,6 +186,13 @@ class MCPInspector:
                 "Content-Type": "application/json",
             }
         )
+        adapter = HTTPAdapter(
+            pool_connections=(self.pool_max_connections or 10),
+            pool_maxsize=(self.pool_max_keepalive or self.pool_max_connections or 20),
+            max_retries=Retry(total=0, raise_on_status=False),
+        )
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
 
     def inspect_request(
         self,
@@ -153,6 +208,8 @@ class MCPInspector:
             "params": _request_params(method, tool_name, arguments),
             "id": next(self._counter),
         }
+        if metadata:
+            payload["metadata"] = dict(metadata)
         return self._post(payload, context="tool_request")
 
     def inspect_response(
@@ -171,6 +228,8 @@ class MCPInspector:
             "result": _result_to_content_dict(result),
             "id": next(self._counter),
         }
+        if metadata:
+            payload["metadata"] = dict(metadata)
         return self._post(payload, context="tool_response")
 
     async def ainspect_request(
@@ -233,7 +292,7 @@ class MCPInspector:
                 return _decision_from_mcp_payload(response.json())
             except Exception as exc:
                 last_error = exc
-                if attempt >= self.retry_total - 1:
+                if attempt >= self.retry_total - 1 or not self._should_retry(exc):
                     break
                 if self.retry_backoff > 0:
                     time.sleep(self.retry_backoff * (2 ** attempt))
@@ -244,6 +303,14 @@ class MCPInspector:
             return Decision.allow([reason], raw_response=last_error)
 
         raise last_error  # type: ignore[misc]
+
+    def _should_retry(self, error: Exception) -> bool:
+        if isinstance(error, (requests.Timeout, requests.ConnectionError)):
+            return True
+        if isinstance(error, requests.HTTPError):
+            response = getattr(error, "response", None)
+            return bool(response is not None and response.status_code in self.retry_status_codes)
+        return False
 
 
 def _messages_to_runtime(messages: list[dict[str, Any]]) -> list[Message]:
@@ -296,6 +363,19 @@ def _inspection_config(default_rules: list[str], entity_types: list[str]) -> Ins
     if not rules:
         return None
     return InspectionConfig(enabled_rules=rules)
+
+
+def _pool_config(
+    *,
+    pool_max_connections: int | None,
+    pool_max_keepalive: int | None,
+) -> dict[str, int]:
+    # requests' adapter doesn't expose keepalive as a first-class setting, so we map the
+    # Cisco-style knobs to the closest pool sizes it does support.
+    return {
+        "pool_connections": pool_max_connections or 10,
+        "pool_maxsize": pool_max_keepalive or pool_max_connections or 20,
+    }
 
 
 def _decision_from_inspect_response(response: Any) -> Decision:
@@ -409,4 +489,3 @@ def _rule_to_dict(rule: Any) -> Any:
     if is_dataclass(rule):
         return asdict(rule)
     return rule
-

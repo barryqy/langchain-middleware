@@ -35,6 +35,9 @@ AGENTSEC_API_MODE_LLM=monitor
 AGENTSEC_API_MODE_MCP=monitor
 AGENTSEC_API_MODE_FAIL_OPEN_LLM=true
 AGENTSEC_API_MODE_FAIL_OPEN_MCP=true
+AGENTSEC_VIOLATION_BEHAVIOR=error
+# Optional template fields: {phase}, {summary}, {reasons}, {mode}, {severity}
+AGENTSEC_VIOLATION_MESSAGE=AI Defense blocked {phase}: {summary}
 
 OPENAI_API_KEY=your-openai-key
 OPENAI_MODEL=gpt-4.1-mini
@@ -82,8 +85,13 @@ result = agent.invoke(
 )
 ```
 
-In `monitor` mode the middleware logs policy hits and continues. In `enforce` mode it
-raises `SecurityPolicyError`.
+In `monitor` mode the middleware logs policy hits and continues.
+
+In `enforce` mode `AGENTSEC_VIOLATION_BEHAVIOR` controls what happens next:
+
+- `error`: raise `SecurityPolicyError`
+- `end`: end the agent run with a safe assistant message
+- `replace`: replace the blocked content with a safe message and keep going when possible
 
 ## Example
 
